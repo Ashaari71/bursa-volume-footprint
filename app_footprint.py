@@ -27,6 +27,23 @@ def fmt_vol(val: float) -> str:
   return f"{int(val)}"
 
 
+def buat_nota_ringkas(row) -> str:
+  """Hasilkan ayat ringkas yang mudah difahami untuk setiap bar 15-minit."""
+  delta = row["Delta"]
+  buy_imb = row["Buy_Imb_Count"]
+  sell_imb = row["Sell_Imb_Count"]
+
+  if delta > 0 and buy_imb > 0:
+    return "Tekanan Belian Dominan"
+  if delta > 0:
+    return "Belian Lebih Kuat"
+  if delta < 0 and sell_imb > 0:
+    return "Tekanan Jualan Dominan"
+  if delta < 0:
+    return "Jualan Lebih Kuat"
+  return "Seimbang / Neutral"
+
+
 # --- SIDEBAR: KAWALAN PENGGUNA ---
 with st.sidebar:
   st.header("⚙️ Tetapan Carta")
@@ -142,7 +159,6 @@ def build_15m_footprint(
       .assign(delta=lambda x: x["ask"] - x["bid"])
   )
 
-  # Pengesanan Buying & Selling Imbalance (elak sifar mutlak dengan ambang minimum)
   min_vol_filter = fp["vol"].median() * 0.25 if not fp.empty else 0
   fp["buy_imb"] = (
       (fp["ask"] > 0)
@@ -155,7 +171,6 @@ def build_15m_footprint(
       & ((fp["ask"] == 0) | (fp["bid"] >= ratio * fp["ask"]))
   )
 
-  # Kira POC (Point of Control)
   poc_map = (
       fp.sort_values("vol", ascending=False)
       .groupby("bar_15m", as_index=False)
@@ -163,7 +178,6 @@ def build_15m_footprint(
       .rename(columns={"price_level": "POC_Price"})
   )
 
-  # Kira jumlah Imbalance per bar
   imb_counts = fp.groupby("bar_15m", as_index=False).agg(
       Buy_Imb_Count=("buy_imb", "sum"),
       Sell_Imb_Count=("sell_imb", "sum"),
@@ -177,6 +191,7 @@ def build_15m_footprint(
   summary_df[["Buy_Imb_Count", "Sell_Imb_Count"]] = (
       summary_df[["Buy_Imb_Count", "Sell_Imb_Count"]].fillna(0).astype(int)
   )
+  summary_df["Nota_Ringkas"] = summary_df.apply(buat_nota_ringkas, axis=1)
 
   return ohlc_15m, fp, poc_map, summary_df
 
@@ -221,12 +236,12 @@ def plot_footprint(
       if is_buy_imb:
         label_text = f"<b>{bid_txt}x{ask_txt}</b>"
         font_color = "#ffffff"
-        bg_color = "rgba(22, 163, 74, 0.92)"  # Hijau terang (Buying Imbalance)
+        bg_color = "rgba(22, 163, 74, 0.92)"
         border_color = "#14532d"
       elif is_sell_imb:
         label_text = f"<b>{bid_txt}x{ask_txt}</b>"
         font_color = "#ffffff"
-        bg_color = "rgba(220, 38, 38, 0.92)"  # Merah terang (Selling Imbalance)
+        bg_color = "rgba(220, 38, 38, 0.92)"
         border_color = "#7f1d1d"
       else:
         label_text = f"{bid_txt}x{ask_txt}"
@@ -305,7 +320,6 @@ ohlc_15m, fp, poc_map, summary_df = build_15m_footprint(
     df_1m, price_step, last_n_bars, imb_ratio
 )
 
-# Kad Metrik Ringkas di Bahagian Atas
 latest_bar = summary_df.iloc[-1]
 total_period_delta = summary_df["Delta"].sum()
 total_buy_imb = int(summary_df["Buy_Imb_Count"].sum())
@@ -318,7 +332,8 @@ c3.metric("Delta Bar Terkini", f"{fmt_vol(latest_bar['Delta'])}")
 c4.metric(f"Jumlah Delta ({last_n_bars} Bar)", f"{fmt_vol(total_period_delta)}")
 c5.metric("Imbalance (Buy / Sell)", f"{total_buy_imb}B / {total_sell_imb}S")
 
-# Plot Carta Utama
+st.info(f"**Bacaan Bar Terkini:** {latest_bar['Nota_Ringkas']}")
+
 fig = plot_footprint(ticker, ohlc_15m, fp, poc_map, label_mode)
 st.plotly_chart(fig, use_container_width=True)
 
@@ -327,6 +342,7 @@ st.subheader("📋 Ringkasan Delta, POC & Imbalance Setiap Bar (15-Minit)")
 
 display_table = summary_df[[
     "bar_15m",
+    "Nota_Ringkas",
     "Open",
     "High",
     "Low",
@@ -343,6 +359,7 @@ display_table = summary_df[[
 display_table["bar_15m"] = display_table["bar_15m"].dt.strftime("%Y-%m-%d %H:%M")
 display_table.columns = [
     "Masa (MYT)",
+    "Nota Ringkas",
     "Open",
     "High",
     "Low",
