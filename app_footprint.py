@@ -11,8 +11,9 @@ st.set_page_config(
 
 st.title("📊 Anggaran Volume Footprint 15-Minit — Bursa Malaysia")
 st.caption(
-    "Menggunakan data intraday 1-minit (yfinance) untuk menganggarkan Bid vs"
-    " Ask Volume, POC, Delta, dan Imbalance setiap selang 15 minit."
+    "Menggunakan data intraday 1-minit (yfinance) dengan agihan julat"
+    " High–Low untuk menganggarkan Bid vs Ask Volume, POC, Delta, dan"
+    " Imbalance setiap 15 minit."
 )
 
 
@@ -119,6 +120,73 @@ def fetch_1m_bursa(symbol: str, lookback: str) -> pd.DataFrame:
   return df
 
 
+def agih_volume_high_low(
+    df_sub: pd.DataFrame, step: float, ratio: float
+) -> pd.DataFrame:
+  """Agihkan volume setiap bar 1m merentasi julat Low hingga High mengikut price_step."""
+  records = []
+  tol = step * 1e-6
+
+  for idx, row in df_sub.iterrows():
+    vol = float(row["Volume"])
+    if vol <= 0:
+      continue
+
+    low_v = float(row["Low"])
+    high_v = float(row["High"])
+    if high_v < low_v:
+      low_v, high_v = high_v, low_v
+
+    start_lvl = np.floor(low_v / step) * step
+    end_lvl = np.ceil(high_v / step) * step
+    levels = np.arange(start_lvl, end_lvl + tol, step)
+    if len(levels) == 0:
+      levels = np.array([np.round(float(row["Close"]) / step) * step])
+
+    per_level_vol = vol / len(levels)
+    is_ask = float(row["Close"]) >= float(row["Open"])
+    bar_15m = idx.floor("15min")
+
+    for lvl in levels:
+      lvl_clean = round(float(lvl), 4)
+      records.append({
+          "bar_15m": bar_15m,
+          "price_level": lvl_clean,
+          "bid": 0.0 if is_ask else per_level_vol,
+          "ask": per_level_vol if is_ask else 0.0,
+          "vol": per_level_vol,
+      })
+
+  if not records:
+    return pd.DataFrame(
+        columns=["bar_15m", "price_level", "bid", "ask", "vol", "delta", "buy_imb", "sell_imb"]
+    )
+
+  raw_fp = pd.DataFrame(records)
+  fp = (
+      raw_fp.groupby(["bar_15m", "price_level"], as_index=False)
+      .agg(
+          bid=("bid", "sum"),
+          ask=("ask", "sum"),
+          vol=("vol", "sum"),
+      )
+      .assign(delta=lambda x: x["ask"] - x["bid"])
+  )
+
+  min_vol_filter = fp["vol"].median() * 0.25 if not fp.empty else 0
+  fp["buy_imb"] = (
+      (fp["ask"] > 0)
+      & (fp["vol"] >= min_vol_filter)
+      & ((fp["bid"] == 0) | (fp["ask"] >= ratio * fp["bid"]))
+  )
+  fp["sell_imb"] = (
+      (fp["bid"] > 0)
+      & (fp["vol"] >= min_vol_filter)
+      & ((fp["ask"] == 0) | (fp["bid"] >= ratio * fp["ask"]))
+  )
+  return fp
+
+
 def build_15m_footprint(
     df_1m: pd.DataFrame, step: float, n_bars: int, ratio: float
 ):
@@ -145,31 +213,9 @@ def build_15m_footprint(
 
   ohlc_15m = ohlc_15m.tail(n_bars)
   active_bars = set(ohlc_15m.index)
-  work = work[work["bar_15m"].isin(active_bars)].copy()
+  work_active = work[work["bar_15m"].isin(active_bars)].copy()
 
-  work["price_level"] = (np.round(work["Close"] / step) * step).round(4)
-
-  fp = (
-      work.groupby(["bar_15m", "price_level"], as_index=False)
-      .agg(
-          bid=("bid_vol", "sum"),
-          ask=("ask_vol", "sum"),
-          vol=("Volume", "sum"),
-      )
-      .assign(delta=lambda x: x["ask"] - x["bid"])
-  )
-
-  min_vol_filter = fp["vol"].median() * 0.25 if not fp.empty else 0
-  fp["buy_imb"] = (
-      (fp["ask"] > 0)
-      & (fp["vol"] >= min_vol_filter)
-      & ((fp["bid"] == 0) | (fp["ask"] >= ratio * fp["bid"]))
-  )
-  fp["sell_imb"] = (
-      (fp["bid"] > 0)
-      & (fp["vol"] >= min_vol_filter)
-      & ((fp["ask"] == 0) | (fp["bid"] >= ratio * fp["ask"]))
-  )
+  fp = agih_volume_high_low(work_active, step=step, ratio=ratio)
 
   poc_map = (
       fp.sort_values("vol", ascending=False)
