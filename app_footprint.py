@@ -12,8 +12,20 @@ st.set_page_config(
 st.title("📊 Anggaran Volume Footprint 15-Minit — Bursa Malaysia")
 st.caption(
     "Menggunakan data intraday 1-minit (yfinance) untuk menganggarkan Bid vs"
-    " Ask Volume, POC, dan Delta setiap selang 15 minit."
+    " Ask Volume, POC, Delta, dan Imbalance setiap selang 15 minit."
 )
+
+
+def fmt_vol(val: float) -> str:
+  """Format nombor volume/delta besar kepada bentuk ringkas (K / M)."""
+  abs_v = abs(val)
+  sign = "-" if val < 0 else ""
+  if abs_v >= 1_000_000:
+    return f"{sign}{abs_v / 1_000_000:.1f}M"
+  if abs_v >= 1_000:
+    return f"{sign}{abs_v / 1_000:.0f}K"
+  return f"{int(val)}"
+
 
 # --- SIDEBAR: KAWALAN PENGGUNA ---
 with st.sidebar:
@@ -50,12 +62,26 @@ with st.sidebar:
       value=0.01,
   )
   last_n_bars = st.slider(
-      "Bilangan Bar 15-Minit Dipaparkan:", min_value=6, max_value=32, value=16
+      "Bilangan Bar 15-Minit Dipaparkan:",
+      min_value=6,
+      max_value=24,
+      value=10,
+      help="Nilai 8-12 paling kemas supaya teks Bid x Ask tidak bertindih.",
   )
-  show_text = st.checkbox(
-      "Papar Label Bid x Ask di Carta",
-      value=True,
-      help="Nyahaktifkan jika carta terlalu padat.",
+  imb_ratio = st.slider(
+      "Nisbah Imbalance (x Ganda):",
+      min_value=2.0,
+      max_value=5.0,
+      value=3.0,
+      step=0.5,
+      help=(
+          "Menandakan paras harga di mana Ask >= Nisbah x Bid (atau sebaliknya)."
+      ),
+  )
+  label_mode = st.radio(
+      "Mod Paparan Label Carta:",
+      ["Semua Paras Harga", "Imbalance Sahaja", "Sembunyikan Label"],
+      index=0,
   )
 
 
@@ -76,7 +102,9 @@ def fetch_1m_bursa(symbol: str, lookback: str) -> pd.DataFrame:
   return df
 
 
-def build_15m_footprint(df_1m: pd.DataFrame, step: float, n_bars: int):
+def build_15m_footprint(
+    df_1m: pd.DataFrame, step: float, n_bars: int, ratio: float
+):
   work = df_1m.copy()
   work["ask_vol"] = np.where(work["Close"] >= work["Open"], work["Volume"], 0.0)
   work["bid_vol"] = np.where(work["Close"] < work["Open"], work["Volume"], 0.0)
@@ -114,6 +142,20 @@ def build_15m_footprint(df_1m: pd.DataFrame, step: float, n_bars: int):
       .assign(delta=lambda x: x["ask"] - x["bid"])
   )
 
+  # Pengesanan Buying & Selling Imbalance (elak sifar mutlak dengan ambang minimum)
+  min_vol_filter = fp["vol"].median() * 0.25 if not fp.empty else 0
+  fp["buy_imb"] = (
+      (fp["ask"] > 0)
+      & (fp["vol"] >= min_vol_filter)
+      & ((fp["bid"] == 0) | (fp["ask"] >= ratio * fp["bid"]))
+  )
+  fp["sell_imb"] = (
+      (fp["bid"] > 0)
+      & (fp["vol"] >= min_vol_filter)
+      & ((fp["ask"] == 0) | (fp["bid"] >= ratio * fp["ask"]))
+  )
+
+  # Kira POC (Point of Control)
   poc_map = (
       fp.sort_values("vol", ascending=False)
       .groupby("bar_15m", as_index=False)
@@ -121,7 +163,21 @@ def build_15m_footprint(df_1m: pd.DataFrame, step: float, n_bars: int):
       .rename(columns={"price_level": "POC_Price"})
   )
 
-  summary_df = ohlc_15m.reset_index().merge(poc_map, on="bar_15m", how="left")
+  # Kira jumlah Imbalance per bar
+  imb_counts = fp.groupby("bar_15m", as_index=False).agg(
+      Buy_Imb_Count=("buy_imb", "sum"),
+      Sell_Imb_Count=("sell_imb", "sum"),
+  )
+
+  summary_df = (
+      ohlc_15m.reset_index()
+      .merge(poc_map, on="bar_15m", how="left")
+      .merge(imb_counts, on="bar_15m", how="left")
+  )
+  summary_df[["Buy_Imb_Count", "Sell_Imb_Count"]] = (
+      summary_df[["Buy_Imb_Count", "Sell_Imb_Count"]].fillna(0).astype(int)
+  )
+
   return ohlc_15m, fp, poc_map, summary_df
 
 
@@ -130,7 +186,7 @@ def plot_footprint(
     ohlc_15m: pd.DataFrame,
     fp: pd.DataFrame,
     poc_map: pd.DataFrame,
-    display_labels: bool,
+    mode: str,
 ):
   fig = go.Figure()
 
@@ -148,16 +204,35 @@ def plot_footprint(
   )
 
   annotations = []
-  if display_labels:
+  if mode != "Sembunyikan Label":
     for _, row in fp.iterrows():
       if row["vol"] <= 0:
         continue
-      delta_val = int(row["delta"])
-      sign = "+" if delta_val > 0 else ""
-      label_text = (
-          f"{int(row['bid']):,}x{int(row['ask']):,} ({sign}{delta_val:,})"
-      )
-      font_color = "#15803d" if delta_val >= 0 else "#b91c1c"
+
+      is_buy_imb = bool(row["buy_imb"])
+      is_sell_imb = bool(row["sell_imb"])
+
+      if mode == "Imbalance Sahaja" and not (is_buy_imb or is_sell_imb):
+        continue
+
+      bid_txt = fmt_vol(row["bid"])
+      ask_txt = fmt_vol(row["ask"])
+
+      if is_buy_imb:
+        label_text = f"<b>{bid_txt}x{ask_txt}</b>"
+        font_color = "#ffffff"
+        bg_color = "rgba(22, 163, 74, 0.92)"  # Hijau terang (Buying Imbalance)
+        border_color = "#14532d"
+      elif is_sell_imb:
+        label_text = f"<b>{bid_txt}x{ask_txt}</b>"
+        font_color = "#ffffff"
+        bg_color = "rgba(220, 38, 38, 0.92)"  # Merah terang (Selling Imbalance)
+        border_color = "#7f1d1d"
+      else:
+        label_text = f"{bid_txt}x{ask_txt}"
+        font_color = "#1f2937"
+        bg_color = "rgba(255, 255, 255, 0.82)"
+        border_color = "rgba(209, 213, 219, 0.8)"
 
       annotations.append(
           dict(
@@ -166,8 +241,10 @@ def plot_footprint(
               text=label_text,
               showarrow=False,
               font=dict(size=9, color=font_color),
-              bgcolor="rgba(255,255,255,0.8)",
-              borderpad=1,
+              bgcolor=bg_color,
+              bordercolor=border_color,
+              borderwidth=1,
+              borderpad=2,
           )
       )
 
@@ -187,14 +264,17 @@ def plot_footprint(
   )
 
   fig.update_layout(
-      title=f"Anggaran Volume Footprint 15-Minit — {symbol}",
+      title=(
+          f"Anggaran Volume Footprint 15-Minit — {symbol} (Hijau = Buy"
+          " Imbalance, Merah = Sell Imbalance)"
+      ),
       xaxis_title="Masa (MYT)",
       yaxis_title="Harga (RM)",
       xaxis_rangeslider_visible=False,
       annotations=annotations,
-      template="plotly_white",
-      height=680,
-      margin=dict(l=20, r=20, t=50, b=20),
+      template="plotly_dark",
+      height=700,
+      margin=dict(l=20, r=20, t=55, b=20),
   )
 
   fig.update_xaxes(
@@ -222,25 +302,28 @@ if df_1m.empty:
   st.stop()
 
 ohlc_15m, fp, poc_map, summary_df = build_15m_footprint(
-    df_1m, price_step, last_n_bars
+    df_1m, price_step, last_n_bars, imb_ratio
 )
 
 # Kad Metrik Ringkas di Bahagian Atas
 latest_bar = summary_df.iloc[-1]
-total_period_delta = int(summary_df["Delta"].sum())
+total_period_delta = summary_df["Delta"].sum()
+total_buy_imb = int(summary_df["Buy_Imb_Count"].sum())
+total_sell_imb = int(summary_df["Sell_Imb_Count"].sum())
 
-c1, c2, c3, c4 = st.columns(4)
+c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("Harga Terakhir", f"RM {latest_bar['Close']:.3f}")
 c2.metric("POC Bar Terkini", f"RM {latest_bar['POC_Price']:.3f}")
-c3.metric("Delta Bar Terkini", f"{int(latest_bar['Delta']):+,}")
-c4.metric(f"Jumlah Delta ({last_n_bars} Bar)", f"{total_period_delta:+,}")
+c3.metric("Delta Bar Terkini", f"{fmt_vol(latest_bar['Delta'])}")
+c4.metric(f"Jumlah Delta ({last_n_bars} Bar)", f"{fmt_vol(total_period_delta)}")
+c5.metric("Imbalance (Buy / Sell)", f"{total_buy_imb}B / {total_sell_imb}S")
 
 # Plot Carta Utama
-fig = plot_footprint(ticker, ohlc_15m, fp, poc_map, show_text)
+fig = plot_footprint(ticker, ohlc_15m, fp, poc_map, label_mode)
 st.plotly_chart(fig, use_container_width=True)
 
-# --- JADUAL RINGKASAN DELTA PER BAR ---
-st.subheader("📋 Ringkasan Delta & POC Setiap Bar (15-Minit)")
+# --- JADUAL RINGKASAN DELTA & IMBALANCE PER BAR ---
+st.subheader("📋 Ringkasan Delta, POC & Imbalance Setiap Bar (15-Minit)")
 
 display_table = summary_df[[
     "bar_15m",
@@ -253,6 +336,8 @@ display_table = summary_df[[
     "Ask_Vol",
     "Delta",
     "Cumulative_Delta",
+    "Buy_Imb_Count",
+    "Sell_Imb_Count",
 ]].copy()
 
 display_table["bar_15m"] = display_table["bar_15m"].dt.strftime("%Y-%m-%d %H:%M")
@@ -267,9 +352,10 @@ display_table.columns = [
     "Ask Vol",
     "Bar Delta",
     "Cum. Delta",
+    "Buy Imb",
+    "Sell Imb",
 ]
 
-# Susun dari bar paling terkini di atas
 display_table = display_table.iloc[::-1].reset_index(drop=True)
 
 st.dataframe(
@@ -283,6 +369,8 @@ st.dataframe(
         "Ask Vol": "{:,.0f}",
         "Bar Delta": "{:+,.0f}",
         "Cum. Delta": "{:+,.0f}",
+        "Buy Imb": "{:d}",
+        "Sell Imb": "{:d}",
     }),
     use_container_width=True,
     hide_index=True,
